@@ -1,0 +1,673 @@
+// SCENTRAVE ERP — Prisma schema (DRAFT for sign-off, not yet migrated)
+// Postgres via Supabase. Auth handled by Supabase Auth; `User` here mirrors
+// auth.users (1:1 via `authId`) and carries app-level role/profile data.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  OWNER
+  ADMIN
+  CASHIER
+  SALES_AGENT
+}
+
+enum ProductType {
+  PERFUME // alcohol-based EDP/EDT — has a Formula, solvent deduction applies
+  OIL // perfume oil / attar — formula optional (only if diluted)
+}
+
+enum Gender {
+  MEN
+  WOMEN
+  UNISEX
+}
+
+enum StockMovementReason {
+  PURCHASE // raw material goods-in
+  PRODUCTION_IN // finished SKU (bottles) added by bottling from bulk liquid
+  PRODUCTION_CONSUME // raw material deducted by a mix
+  MIX_IN // bulk liquid (ml) added by mixing a batch per formula
+  BOTTLING_CONSUME // bulk liquid (ml) deducted when bottled into sellable sizes
+  SALE
+  RETURN
+  DAMAGE
+  ADJUSTMENT
+  OPENING_BALANCE
+}
+
+enum StockableType {
+  RAW_MATERIAL
+  PRODUCT_VARIANT
+  BULK_LIQUID // unbottled finished perfume, tracked in ml per product — the same mix supplies every bottle size
+}
+
+enum OrderStatus {
+  DRAFT // parked / held bill
+  CONFIRMED
+  PARTIALLY_RETURNED
+  RETURNED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+enum PaymentMethod {
+  CASH
+  UPI_DYNAMIC_QR
+  UPI_STATIC_QR
+  CARD
+  BANK_TRANSFER
+  LOYALTY_POINTS
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum DiscountType {
+  FLAT
+  PERCENTAGE
+  BUY_X_GET_Y
+}
+
+enum DiscountScope {
+  ORDER
+  CATEGORY
+  PRODUCT
+}
+
+enum LoyaltyLedgerType {
+  EARNED
+  REDEEMED
+  EXPIRED
+  ADJUSTED
+}
+
+enum LoyaltyTier {
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+enum NotificationType {
+  LOW_STOCK
+  PAYMENT_RECEIVED
+  PAYMENT_FAILED
+  BATCH_COMPLETED
+  FOLLOW_UP_DUE
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// USERS / ROLES (Supabase Auth mirror)
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(uuid())
+  authId    String   @unique // maps to Supabase auth.users.id
+  name      String
+  email     String   @unique
+  phone     String?
+  role      Role     @default(CASHIER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  batchesCreated    Batch[]                 @relation("BatchCreatedBy")
+  mixBatchesCreated MixBatch[]              @relation("MixBatchCreatedBy")
+  ordersCreated   Order[]                 @relation("OrderCashier")
+  stockMovements  StockMovement[]         @relation("StockMovementActor")
+  priceChangeLogs PriceChangeLog[]
+  customerTasks   CustomerTask[]          @relation("TaskAssignee")
+  customerNotes   CustomerNote[]
+  notifications   NotificationRecipient[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PRODUCT HIERARCHY
+// ─────────────────────────────────────────────────────────────────────────
+
+model Category {
+  id            String        @id @default(uuid())
+  name          String        @unique // "Perfume", "Oil"
+  slug          String        @unique
+  sortOrder     Int           @default(0)
+  subcategories Subcategory[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@map("categories")
+}
+
+model Subcategory {
+  id                String    @id @default(uuid())
+  categoryId        String
+  category          Category  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  name              String // "Solvent" (raw material view, admin-only), "Perfumes", "Oils"
+  slug              String
+  isRawMaterialView Boolean   @default(false) // true = admin-only raw material subview, not customer-facing
+  sortOrder         Int       @default(0)
+  products          Product[]
+
+  @@unique([categoryId, slug])
+  @@map("subcategories")
+}
+
+model Product {
+  id              String      @id @default(uuid())
+  subcategoryId   String
+  subcategory     Subcategory @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
+  type            ProductType
+  name            String
+  description     String?
+  fragranceFamily String? // e.g. "Woody", "Floral" — the primary merchandising axis; subcategory mirrors this for perfumes
+  gender          Gender? // filterable attribute, not a separate category level — most attars/dupes span genders
+  isActive        Boolean     @default(true)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  variants  ProductVariant[]
+  formulas  Formula[]
+  mixBatches MixBatch[]
+  stockLevel     StockLevel?
+  stockMovements StockMovement[]
+
+  @@map("products")
+}
+
+// One row per size SKU (3ml Tester, 10ml Tester, 25ml, 50ml / 2ml, 3ml, 6ml, 10ml)
+model ProductVariant {
+  id                String   @id @default(uuid())
+  productId         String
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  sizeMl            Decimal  @db.Decimal(8, 2)
+  sizeLabel         String // "3ml Tester", "50ml" — display label
+  sku               String   @unique
+  barcode           String?  @unique
+  isTester          Boolean  @default(false)
+  costPrice         Decimal? @db.Decimal(10, 2) // COGS snapshot, Owner/Admin only
+  sellingPrice      Decimal  @db.Decimal(10, 2) // default/retail price; PriceList overrides per list
+  lowStockThreshold Int      @default(5)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  orderItems     OrderItem[]
+  priceListItems PriceListItem[]
+  batches        Batch[]
+  stockLevel     StockLevel?
+  stockMovements StockMovement[]
+
+  @@map("product_variants")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FORMULAS & RAW MATERIALS (production / solvent deduction)
+// ─────────────────────────────────────────────────────────────────────────
+
+model RawMaterial {
+  id                String   @id @default(uuid())
+  name              String // "Ethanol", "DPG", "Rose Attar Concentrate", "50ml Bottle", "Cap - Gold"
+  unit              String // "ml", "g", "unit"
+  category          String // "Solvent", "Concentrate", "Packaging" — free-text grouping
+  costPerUnit       Decimal  @db.Decimal(10, 4) // Owner/Admin only visibility enforced at API layer
+  lowStockThreshold Decimal  @default(0) @db.Decimal(10, 2)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  formulaLines   FormulaLine[]
+  stockLevel     StockLevel?
+  stockMovements StockMovement[]
+
+  @@map("raw_materials")
+}
+
+// A Formula is versioned: editing recipe % creates a new version rather than
+// mutating history, so past batches remain auditable against the version used.
+model Formula {
+  id          String   @id @default(uuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  version     Int      @default(1)
+  isActive    Boolean  @default(true) // only one active version per product at a time
+  notes       String?
+  createdAt   DateTime @default(now())
+  createdById String?
+
+  lines      FormulaLine[]
+  batches    Batch[]
+  mixBatches MixBatch[]
+
+  @@unique([productId, version])
+  @@map("formulas")
+}
+
+// e.g. 18% attar / 2% fixative / 80% solvent per ml of finished product
+model FormulaLine {
+  id            String      @id @default(uuid())
+  formulaId     String
+  formula       Formula     @relation(fields: [formulaId], references: [id], onDelete: Cascade)
+  rawMaterialId String
+  rawMaterial   RawMaterial @relation(fields: [rawMaterialId], references: [id], onDelete: Restrict)
+  quantityPerMl Decimal     @db.Decimal(10, 6) // raw material units consumed per 1ml of finished product
+
+  @@unique([formulaId, rawMaterialId])
+  @@map("formula_lines")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PRODUCTION BATCHES
+// ─────────────────────────────────────────────────────────────────────────
+
+model Batch {
+  id               String         @id @default(uuid())
+  batchNumber      String         @unique // e.g. "BATCH-2526-0001"
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Restrict)
+  formulaId        String? // null for undiluted oils bottled without a formula
+  formula          Formula?       @relation(fields: [formulaId], references: [id], onDelete: Restrict)
+  quantityProduced Int // bottle count of the finished SKU
+  totalMlProduced  Decimal        @db.Decimal(10, 2) // quantityProduced * variant.sizeMl
+  productionDate   DateTime       @default(now())
+  expiryDate       DateTime?
+  createdById      String
+  createdBy        User           @relation("BatchCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  notes            String?
+  createdAt        DateTime       @default(now())
+
+  stockMovements StockMovement[]
+
+  @@map("batches")
+}
+
+// A mix is the first stage of making a perfume: raw materials go in per the
+// formula and come out as bulk liquid (ml), not bottles. One mix can later
+// be bottled into any split of 10ml/25ml/50ml — the sizes are just how the
+// same liquid gets packaged, never separate products.
+model MixBatch {
+  id           String   @id @default(uuid())
+  mixNumber    String   @unique // e.g. "MIX-2526-0001"
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  formulaId    String?
+  formula      Formula? @relation(fields: [formulaId], references: [id], onDelete: Restrict)
+  totalMlMixed Decimal  @db.Decimal(10, 2)
+  mixDate      DateTime @default(now())
+  createdById  String
+  createdBy    User     @relation("MixBatchCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  stockMovements StockMovement[]
+
+  @@map("mix_batches")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// STOCK — single source of truth. ALL stock mutations go through StockMovement;
+// StockLevel is a denormalized running-total cache updated in the same
+// transaction as each movement (never written directly elsewhere).
+// ─────────────────────────────────────────────────────────────────────────
+
+model StockMovement {
+  id               String              @id @default(uuid())
+  stockableType    StockableType
+  rawMaterialId    String?
+  rawMaterial      RawMaterial?        @relation(fields: [rawMaterialId], references: [id], onDelete: Restrict)
+  productVariantId String?
+  productVariant   ProductVariant?     @relation(fields: [productVariantId], references: [id], onDelete: Restrict)
+  productId        String? // bulk liquid movements (mix in / bottling consume) key off the product, not a size variant
+  product          Product?            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantityDelta    Decimal             @db.Decimal(12, 4) // signed: +in / -out
+  reason           StockMovementReason
+  batchId          String?
+  batch            Batch?              @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  mixBatchId       String?
+  mixBatch         MixBatch?           @relation(fields: [mixBatchId], references: [id], onDelete: SetNull)
+  orderId          String?
+  order            Order?              @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  actorId          String
+  actor            User                @relation("StockMovementActor", fields: [actorId], references: [id], onDelete: Restrict)
+  note             String?
+  createdAt        DateTime            @default(now())
+
+  @@index([rawMaterialId])
+  @@index([productVariantId])
+  @@index([productId])
+  @@map("stock_movements")
+}
+
+// Denormalized current-quantity cache, one row per stockable item, for fast
+// reads (dashboard, low-stock checks) without summing the movement ledger.
+model StockLevel {
+  id               String          @id @default(uuid())
+  rawMaterialId    String?         @unique
+  rawMaterial      RawMaterial?    @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  productVariantId String?         @unique
+  productVariant   ProductVariant? @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  productId        String?         @unique // bulk liquid (ml) on hand for this perfume, unbottled
+  product          Product?        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantityOnHand   Decimal         @default(0) @db.Decimal(12, 4)
+  updatedAt        DateTime        @updatedAt
+
+  @@map("stock_levels")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PRICE LISTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model PriceList {
+  id        String   @id @default(uuid())
+  name      String   @unique // "Retail", "Wholesale", "Distributor", "Festive Offer"
+  isDefault Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items      PriceListItem[]
+  customers  Customer[]
+  changeLogs PriceChangeLog[]
+
+  @@map("price_lists")
+}
+
+model PriceListItem {
+  id               String         @id @default(uuid())
+  priceListId      String
+  priceList        PriceList      @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  price            Decimal        @db.Decimal(10, 2)
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([priceListId, productVariantId])
+  @@map("price_list_items")
+}
+
+model PriceChangeLog {
+  id               String    @id @default(uuid())
+  priceListId      String
+  priceList        PriceList @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  productVariantId String
+  oldPrice         Decimal   @db.Decimal(10, 2)
+  newPrice         Decimal   @db.Decimal(10, 2)
+  changedById      String
+  changedBy        User      @relation(fields: [changedById], references: [id], onDelete: Restrict)
+  createdAt        DateTime  @default(now())
+
+  @@map("price_change_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DISCOUNTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Discount {
+  id          String        @id @default(uuid())
+  code        String?       @unique // null = automatic discount, not coupon-gated
+  name        String
+  type        DiscountType
+  scope       DiscountScope @default(ORDER)
+  value       Decimal?      @db.Decimal(10, 2) // flat ₹ or % depending on type
+  buyQuantity Int? // for BUY_X_GET_Y
+  getQuantity Int?
+  categoryId  String? // if scope = CATEGORY
+  productId   String? // if scope = PRODUCT
+  startsAt    DateTime?
+  expiresAt   DateTime?
+  usageLimit  Int?
+  usageCount  Int           @default(0)
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+
+  orders Order[]
+
+  @@map("discounts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CUSTOMERS / CRM / LOYALTY
+// ─────────────────────────────────────────────────────────────────────────
+
+model Customer {
+  id                String       @id @default(uuid())
+  name              String
+  phone             String       @unique
+  email             String?
+  state             String // for GST place-of-supply comparison against home state
+  gstin             String? // for B2B invoicing
+  address           String? // shipping/primary address, printed on invoices
+  billingAddress    String? // null = same as shipping address on invoices
+  priceListId       String?
+  priceList         PriceList?   @relation(fields: [priceListId], references: [id], onDelete: SetNull)
+  loyaltyTier       LoyaltyTier?
+  loyaltyPoints     Int          @default(0) // denormalized running balance; source of truth is LoyaltyLedger
+  preferredCategory String? // "Oil buyers only" style tag, informs segmentation
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  orders        Order[]
+  loyaltyLedger LoyaltyLedgerEntry[]
+  tasks         CustomerTask[]
+  notes         CustomerNote[]
+  segments      CustomerSegment[]
+
+  @@map("customers")
+}
+
+model CustomerSegment {
+  id          String     @id @default(uuid())
+  name        String     @unique // "Oil buyers only", "High-value 50ml perfume buyers"
+  description String?
+  customers   Customer[]
+  createdAt   DateTime   @default(now())
+
+  @@map("customer_segments")
+}
+
+model CustomerTask {
+  id         String    @id @default(uuid())
+  customerId String
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  assigneeId String
+  assignee   User      @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: Restrict)
+  title      String // "Call customer for reorder"
+  dueAt      DateTime?
+  isDone     Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+
+  @@map("customer_tasks")
+}
+
+model CustomerNote {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User     @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  body       String // call notes, complaints, feedback — timeline entry
+  createdAt  DateTime @default(now())
+
+  @@map("customer_notes")
+}
+
+model LoyaltyLedgerEntry {
+  id         String            @id @default(uuid())
+  customerId String
+  customer   Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  type       LoyaltyLedgerType
+  points     Int // signed
+  orderId    String?
+  order      Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  note       String?
+  createdAt  DateTime          @default(now())
+
+  @@map("loyalty_ledger")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ORDERS / BILLING / INVOICES / PAYMENTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Order {
+  id             String      @id @default(uuid())
+  orderNumber    String      @unique // internal reference, separate from invoice number
+  customerId     String?
+  customer       Customer?   @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  guestName      String? // typed at checkout when no saved Customer is linked — no Customer record is created for this
+  guestPhone     String? // same — if it matches an existing Customer's phone, that customer is linked automatically instead
+  cashierId      String
+  cashier        User        @relation("OrderCashier", fields: [cashierId], references: [id], onDelete: Restrict)
+  status         OrderStatus @default(DRAFT) // DRAFT = held/parked bill
+  discountId     String?
+  discount       Discount?   @relation(fields: [discountId], references: [id], onDelete: SetNull)
+  subtotal       Decimal     @db.Decimal(10, 2)
+  discountAmount Decimal     @default(0) @db.Decimal(10, 2)
+  taxAmount      Decimal     @default(0) @db.Decimal(10, 2)
+  total          Decimal     @db.Decimal(10, 2)
+  customerState  String // snapshot at time of sale, for tax breakup
+  isIgst         Boolean // derived: customerState != home state
+  parkedAt       DateTime? // set while status = DRAFT and held at counter
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  items          OrderItem[]
+  invoice        Invoice?
+  stockMovements StockMovement[]
+  loyaltyEntries LoyaltyLedgerEntry[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id               String         @id @default(uuid())
+  orderId          String
+  order            Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Restrict)
+  quantity         Int
+  unitPrice        Decimal        @db.Decimal(10, 2) // price at time of sale (from applicable PriceList)
+  discountAmount   Decimal        @default(0) @db.Decimal(10, 2)
+  taxRate          Decimal        @db.Decimal(5, 2) // GST % applied
+  taxAmount        Decimal        @db.Decimal(10, 2)
+  lineTotal        Decimal        @db.Decimal(10, 2)
+  returnedQuantity Int            @default(0) // supports partial returns
+  customLabel      String? // set only for custom-amount charges (a reserved catalog placeholder variant) — overrides the product name shown on the invoice
+
+  @@map("order_items")
+}
+
+model Invoice {
+  id            String        @id @default(uuid())
+  invoiceNumber String        @unique // "SCV/25-26/00001" — sequential, FY-based
+  financialYear String // "25-26" — used to reset the sequence
+  sequence      Int // per-FY sequence number backing invoiceNumber
+  orderId       String        @unique
+  order         Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  status        InvoiceStatus @default(UNPAID)
+  pdfUrl        String? // Supabase Storage path once generated
+  issuedAt      DateTime      @default(now())
+
+  payments Payment[]
+
+  @@map("invoices")
+}
+
+// Backs every FY-based sequential number in the system (invoices, batches,
+// orders). Keyed as "<kind>-<financialYear>", e.g. "invoice-25-26",
+// "batch-25-26". Incremented atomically inside the same transaction that
+// consumes the number, so no two records can ever collide.
+model Sequence {
+  key          String @id // "invoice-25-26", "batch-25-26", "order-25-26"
+  lastSequence Int    @default(0)
+
+  @@map("sequences")
+}
+
+model Payment {
+  id                String        @id @default(uuid())
+  invoiceId         String
+  invoice           Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  method            PaymentMethod
+  amount            Decimal       @db.Decimal(10, 2)
+  status            PaymentStatus @default(PENDING)
+  razorpayOrderId   String?       @unique // set when method = UPI_DYNAMIC_QR
+  razorpayPaymentId String?       @unique
+  razorpaySignature String?
+  webhookPayload    Json? // raw webhook body for reconciliation/audit
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+
+  @@map("payments")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id        String           @id @default(uuid())
+  type      NotificationType
+  title     String
+  body      String
+  metadata  Json? // e.g. { rawMaterialId, currentQty, threshold }
+  createdAt DateTime         @default(now())
+
+  recipients NotificationRecipient[]
+
+  @@map("notifications")
+}
+
+model NotificationRecipient {
+  id             String       @id @default(uuid())
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  readAt         DateTime?
+
+  @@unique([notificationId, userId])
+  @@map("notification_recipients")
+}
+
+// Single row (fixed id) holding the business identity used across Billing —
+// invoices, tax place-of-supply, and the UPI QR. Previously hardcoded in
+// .env, which meant changing them needed a redeploy; now owner-editable at
+// runtime.
+model ShopSettings {
+  id            String   @id @default("singleton")
+  shopName      String   @default("Scentrave")
+  address       String?
+  gstin         String?
+  phone         String?
+  email         String?
+  gstHomeState  String
+  invoicePrefix String   @default("SCV")
+  upiVpa        String?
+  upiPayeeName  String?
+  updatedAt     DateTime @updatedAt
+}
